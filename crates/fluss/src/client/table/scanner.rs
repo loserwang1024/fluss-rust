@@ -24,6 +24,7 @@ use crate::client::table::log_fetch_buffer::{
     CompletedFetch, DefaultCompletedFetch, FetchErrorAction, FetchErrorContext, FetchErrorLogLevel,
     LogFetchBuffer, RemotePendingFetch,
 };
+use crate::client::table::read_context_resolver::{ReadContextResolver, extract_schema_ids};
 use crate::client::table::remote_log::{RemoteLogDownloader, RemoteLogFetchInfo};
 use crate::config::Config;
 use crate::error::Error::UnsupportedOperation;
@@ -326,12 +327,14 @@ impl<'a> TableScan<'a> {
     pub fn create_log_scanner(self) -> Result<LogScanner> {
         self.reject_limit("LogScanner")?;
         validate_scan_support_inner(&self.table_info.table_path, &self.table_info, true)?;
+        let admin = self.conn.get_admin()?;
         let inner = LogScannerInner::new(
             &self.table_info,
             self.metadata.clone(),
             self.conn.get_connections(),
             self.conn.config(),
             self.projected_fields,
+            admin,
         )?;
         Ok(LogScanner {
             inner: Arc::new(inner),
@@ -347,12 +350,14 @@ impl<'a> TableScan<'a> {
     pub fn create_record_batch_log_scanner(self) -> Result<RecordBatchLogScanner> {
         self.reject_limit("RecordBatchLogScanner")?;
         validate_scan_support(&self.table_info.table_path, &self.table_info)?;
+        let admin = self.conn.get_admin()?;
         let inner = LogScannerInner::new(
             &self.table_info,
             self.metadata.clone(),
             self.conn.get_connections(),
             self.conn.config(),
             self.projected_fields,
+            admin,
         )?;
         Ok(RecordBatchLogScanner {
             inner: Arc::new(inner),
@@ -537,6 +542,7 @@ impl LogScannerInner {
         connections: Arc<RpcClient>,
         config: &Config,
         projected_fields: Option<Vec<usize>>,
+        admin: Arc<crate::client::admin::FlussAdmin>,
     ) -> Result<Self> {
         let log_scanner_status = Arc::new(LogScannerStatus::new());
 
@@ -552,6 +558,15 @@ impl LogScannerInner {
             }
             None => to_arrow_schema(full_row_type)?,
         };
+
+        // Create schema getter for schema evolution support
+        let latest_schema =
+            SchemaInfo::new(table_info.get_schema().clone(), table_info.get_schema_id());
+        let schema_getter = Arc::new(ClientSchemaGetter::new(
+            table_info.table_path.clone(),
+            admin,
+            latest_schema,
+        ));
 
         let metrics = Arc::new(ScannerMetrics::new(&table_info.table_path));
         let last_poll_unix_ms = Arc::new(AtomicI64::new(0));
@@ -573,6 +588,7 @@ impl LogScannerInner {
                 config,
                 projected_fields,
                 Arc::clone(&metrics),
+                schema_getter,
             )?,
             arrow_schema,
             reader_active: std::sync::atomic::AtomicBool::new(false),
@@ -1122,8 +1138,8 @@ struct LogFetcher {
     table_path: TablePath,
     is_partitioned: bool,
     log_scanner_status: Arc<LogScannerStatus>,
-    read_context: ReadContext,
-    remote_read_context: ReadContext,
+    resolver: Arc<ReadContextResolver>,
+    schema_getter: Arc<ClientSchemaGetter>,
     remote_log_downloader: Arc<RemoteLogDownloader>,
     /// Background security token manager for remote filesystem access.
     /// Kept alive to run the background refresh task; stopped on drop.
@@ -1145,8 +1161,8 @@ struct FetchResponseContext {
     metadata: Arc<Metadata>,
     log_fetch_buffer: Arc<LogFetchBuffer>,
     log_scanner_status: Arc<LogScannerStatus>,
-    read_context: ReadContext,
-    remote_read_context: ReadContext,
+    resolver: Arc<ReadContextResolver>,
+    schema_getter: Arc<ClientSchemaGetter>,
     remote_log_downloader: Arc<RemoteLogDownloader>,
     /// Per-table scanner metric handles for `scanner.fetch_*` recording.
     metrics: Arc<ScannerMetrics>,
@@ -1156,6 +1172,7 @@ struct FetchResponseContext {
 }
 
 impl LogFetcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table_info: TableInfo,
         conns: Arc<RpcClient>,
@@ -1164,6 +1181,7 @@ impl LogFetcher {
         config: &Config,
         projected_fields: Option<Vec<usize>>,
         metrics: Arc<ScannerMetrics>,
+        schema_getter: Arc<ClientSchemaGetter>,
     ) -> Result<Self> {
         let full_row_type = table_info.get_row_type();
         let full_arrow_schema = to_arrow_schema(full_row_type)?;
@@ -1191,8 +1209,16 @@ impl LogFetcher {
         )?
         .with_fluss_row_type(projected_row_type);
 
+        let initial_schema_id = table_info.get_schema_id() as i16;
+        let resolver = Arc::new(ReadContextResolver::new(
+            initial_schema_id,
+            read_context,
+            remote_read_context,
+            projected_fields,
+        ));
+
         let tmp_dir = TempDir::with_prefix("fluss-remote-logs")?;
-        let log_fetch_buffer = Arc::new(LogFetchBuffer::new(read_context.clone()));
+        let log_fetch_buffer = Arc::new(LogFetchBuffer::new(Arc::clone(&resolver)));
 
         // Create security token manager for background token refresh
         let security_token_manager =
@@ -1219,8 +1245,8 @@ impl LogFetcher {
             table_path: table_info.table_path.clone(),
             is_partitioned: table_info.is_partitioned(),
             log_scanner_status,
-            read_context,
-            remote_read_context,
+            resolver,
+            schema_getter,
             remote_log_downloader,
             security_token_manager,
             log_fetch_buffer,
@@ -1393,8 +1419,8 @@ impl LogFetcher {
             let conns = Arc::clone(&self.conns);
             let log_fetch_buffer = self.log_fetch_buffer.clone();
             let log_scanner_status = self.log_scanner_status.clone();
-            let read_context = self.read_context.clone();
-            let remote_read_context = self.remote_read_context.clone();
+            let resolver = Arc::clone(&self.resolver);
+            let schema_getter = Arc::clone(&self.schema_getter);
             let remote_log_downloader = Arc::clone(&self.remote_log_downloader);
             let nodes_with_pending = self.nodes_with_pending_fetch_requests.clone();
             let metadata = self.metadata.clone();
@@ -1456,8 +1482,8 @@ impl LogFetcher {
                     metadata: metadata.clone(),
                     log_fetch_buffer,
                     log_scanner_status,
-                    read_context,
-                    remote_read_context,
+                    resolver,
+                    schema_getter,
                     remote_log_downloader,
                     metrics,
                     request_start_time,
@@ -1487,8 +1513,8 @@ impl LogFetcher {
             metadata,
             log_fetch_buffer,
             log_scanner_status,
-            read_context,
-            remote_read_context,
+            resolver,
+            schema_getter,
             remote_log_downloader,
             metrics,
             request_start_time,
@@ -1581,7 +1607,7 @@ impl LogFetcher {
                     Self::pending_remote_fetches(
                         remote_log_downloader.clone(),
                         log_fetch_buffer.clone(),
-                        remote_read_context.clone(),
+                        Arc::clone(&resolver),
                         &table_bucket,
                         remote_fetch_info,
                         fetch_offset,
@@ -1592,13 +1618,35 @@ impl LogFetcher {
                     let high_watermark = fetch_log_for_bucket.high_watermark.unwrap_or(-1);
                     let records = fetch_log_for_bucket.records.unwrap_or(vec![]);
                     let size_in_bytes = records.len();
-                    let log_record_batch = LogRecordsBatches::new(records);
 
+                    // Pre-resolve schemas for schema evolution support
+                    let schema_ids = extract_schema_ids(&records);
+                    for schema_id in schema_ids {
+                        if !resolver.contains(schema_id) {
+                            match schema_getter.get_schema(schema_id as i32).await {
+                                Ok(schema) => {
+                                    if let Err(e) = resolver.register_schema(schema_id, &schema) {
+                                        warn!(
+                                            "Failed to register schema {schema_id} for bucket {table_bucket}: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to fetch schema {schema_id} for bucket {table_bucket}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    let log_record_batch = LogRecordsBatches::new(records);
                     let completed_fetch = DefaultCompletedFetch::new(
                         table_bucket.clone(),
                         log_record_batch,
                         size_in_bytes,
-                        read_context.clone(),
+                        Arc::clone(&resolver),
+                        false, // is_remote
                         fetch_offset,
                         high_watermark,
                     );
@@ -1611,7 +1659,7 @@ impl LogFetcher {
     fn pending_remote_fetches(
         remote_log_downloader: Arc<RemoteLogDownloader>,
         log_fetch_buffer: Arc<LogFetchBuffer>,
-        read_context: ReadContext,
+        resolver: Arc<ReadContextResolver>,
         table_bucket: &TableBucket,
         remote_fetch_info: RemoteLogFetchInfo,
         fetch_offset: i64,
@@ -1647,7 +1695,7 @@ impl LogFetcher {
                 pos_in_log_segment,
                 current_fetch_offset,
                 high_watermark,
-                read_context.clone(),
+                Arc::clone(&resolver),
             );
             // Add to pending fetches in buffer (similar to Java's logFetchBuffer.pend)
             log_fetch_buffer.pend(Box::new(pending_fetch));
@@ -2057,11 +2105,15 @@ impl LogFetcher {
         if ready_for_fetch_count == 0 {
             HashMap::new()
         } else {
-            let (projection_enabled, projected_fields) =
-                match self.read_context.project_fields_in_order() {
-                    None => (false, vec![]),
-                    Some(fields) => (true, fields.iter().map(|&i| i as i32).collect()),
-                };
+            let initial_ctx = self
+                .resolver
+                .resolve(self.resolver.initial_schema_id(), false)
+                .expect("initial ReadContext must exist");
+            let (projection_enabled, projected_fields) = match initial_ctx.project_fields_in_order()
+            {
+                None => (false, vec![]),
+                Some(fields) => (true, fields.iter().map(|&i| i as i32).collect()),
+            };
 
             fetch_log_req_for_buckets
                 .into_iter()
@@ -2280,7 +2332,9 @@ fn validate_scan_support_inner(
 mod tests {
     use super::*;
     use crate::client::WriteRecord;
+    use crate::client::admin::FlussAdmin;
     use crate::client::metadata::Metadata;
+    use crate::client::table::read_context_resolver::ReadContextResolver;
     use crate::compression::{
         ArrowCompressionInfo, ArrowCompressionRatioEstimator, ArrowCompressionType,
         DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
@@ -2293,6 +2347,41 @@ mod tests {
     use crate::test_utils::{
         assert_scanner_entries_labeled, build_cluster_arc, build_table_info, test_scanner_metrics,
     };
+
+    fn test_admin(metadata: &Arc<Metadata>) -> Arc<FlussAdmin> {
+        Arc::new(FlussAdmin::new(
+            Arc::new(RpcClient::new()),
+            metadata.clone(),
+        ))
+    }
+
+    fn test_schema_getter(
+        table_info: &TableInfo,
+        metadata: &Arc<Metadata>,
+    ) -> Arc<ClientSchemaGetter> {
+        let latest = SchemaInfo::new(table_info.get_schema().clone(), table_info.get_schema_id());
+        Arc::new(ClientSchemaGetter::new(
+            table_info.table_path.clone(),
+            test_admin(metadata),
+            latest,
+        ))
+    }
+
+    fn test_resolver(table_info: &TableInfo) -> Arc<ReadContextResolver> {
+        let row_type = table_info.get_row_type();
+        let arrow_schema = to_arrow_schema(row_type).unwrap();
+        let row_type_arc = Arc::new(row_type.clone());
+        let local_ctx = ReadContext::new(arrow_schema.clone(), row_type_arc.clone(), false)
+            .with_fluss_row_type(row_type_arc.clone());
+        let remote_ctx = ReadContext::new(arrow_schema, row_type_arc.clone(), true)
+            .with_fluss_row_type(row_type_arc);
+        Arc::new(ReadContextResolver::new(
+            table_info.get_schema_id() as i16,
+            local_ctx,
+            remote_ctx,
+            None,
+        ))
+    }
 
     fn build_records(table_info: &TableInfo, table_path: Arc<TablePath>) -> Result<Vec<u8>> {
         let mut builder = MemoryLogRecordsArrowBuilder::new(
@@ -2326,11 +2415,12 @@ mod tests {
         let fetcher = LogFetcher::new(
             table_info.clone(),
             Arc::new(RpcClient::new()),
-            metadata,
+            metadata.clone(),
             status.clone(),
             &Config::default(),
             None,
             test_scanner_metrics(&table_path),
+            test_schema_getter(&table_info, &metadata),
         )?;
 
         let bucket = TableBucket::new(1, 0);
@@ -2338,10 +2428,16 @@ mod tests {
 
         let data = build_records(&table_info, Arc::new(table_path))?;
         let log_records = LogRecordsBatches::new(data.clone());
-        let row_type = Arc::new(table_info.get_row_type().clone());
-        let read_context = ReadContext::new(to_arrow_schema(&row_type)?, row_type, false);
-        let completed =
-            DefaultCompletedFetch::new(bucket.clone(), log_records, data.len(), read_context, 0, 0);
+        let resolver = test_resolver(&table_info);
+        let completed = DefaultCompletedFetch::new(
+            bucket.clone(),
+            log_records,
+            data.len(),
+            resolver,
+            false,
+            0,
+            0,
+        );
         fetcher.log_fetch_buffer.add(Box::new(completed));
 
         let fetched = fetcher.collect_fetches()?;
@@ -2360,23 +2456,24 @@ mod tests {
         let fetcher = LogFetcher::new(
             table_info.clone(),
             Arc::new(RpcClient::new()),
-            metadata,
+            metadata.clone(),
             status,
             &Config::default(),
             None,
             test_scanner_metrics(&table_path),
+            test_schema_getter(&table_info, &metadata),
         )?;
 
         let bucket = TableBucket::new(1, 0);
         let data = build_records(&table_info, Arc::new(table_path))?;
         let log_records = LogRecordsBatches::new(data.clone());
-        let row_type = Arc::new(table_info.get_row_type().clone());
-        let read_context = ReadContext::new(to_arrow_schema(&row_type)?, row_type, false);
+        let resolver = test_resolver(&table_info);
         let mut completed: Box<dyn CompletedFetch> = Box::new(DefaultCompletedFetch::new(
             bucket,
             log_records,
             data.len(),
-            read_context,
+            resolver,
+            false,
             0,
             0,
         ));
@@ -2396,13 +2493,14 @@ mod tests {
         let status = Arc::new(LogScannerStatus::new());
         status.assign_scan_bucket(TableBucket::new(1, 0), 0);
         let fetcher = LogFetcher::new(
-            table_info,
+            table_info.clone(),
             Arc::new(RpcClient::new()),
-            metadata,
+            metadata.clone(),
             status,
             &Config::default(),
             None,
             test_scanner_metrics(&table_path),
+            test_schema_getter(&table_info, &metadata),
         )?;
 
         fetcher.nodes_with_pending_fetch_requests.lock().insert(1);
@@ -2428,6 +2526,7 @@ mod tests {
             &Config::default(),
             None,
             test_scanner_metrics(&table_path),
+            test_schema_getter(&table_info, &metadata),
         )?;
 
         let response = FetchLogResponse {
@@ -2451,8 +2550,8 @@ mod tests {
             metadata: metadata.clone(),
             log_fetch_buffer: fetcher.log_fetch_buffer.clone(),
             log_scanner_status: fetcher.log_scanner_status.clone(),
-            read_context: fetcher.read_context.clone(),
-            remote_read_context: fetcher.remote_read_context.clone(),
+            resolver: Arc::clone(&fetcher.resolver),
+            schema_getter: Arc::clone(&fetcher.schema_getter),
             remote_log_downloader: fetcher.remote_log_downloader.clone(),
             metrics: Arc::clone(&fetcher.metrics),
             request_start_time: Instant::now(),
@@ -2482,6 +2581,7 @@ mod tests {
             &Config::default(),
             None,
             test_scanner_metrics(&table_path),
+            test_schema_getter(&table_info, &metadata),
         )?;
 
         let bucket = TableBucket::new(1, 0);
@@ -2508,8 +2608,8 @@ mod tests {
             metadata: metadata.clone(),
             log_fetch_buffer: fetcher.log_fetch_buffer.clone(),
             log_scanner_status: fetcher.log_scanner_status.clone(),
-            read_context: fetcher.read_context.clone(),
-            remote_read_context: fetcher.remote_read_context.clone(),
+            resolver: Arc::clone(&fetcher.resolver),
+            schema_getter: Arc::clone(&fetcher.schema_getter),
             remote_log_downloader: fetcher.remote_log_downloader.clone(),
             metrics: Arc::clone(&fetcher.metrics),
             request_start_time: Instant::now(),
@@ -2608,13 +2708,14 @@ mod tests {
         };
 
         let fetcher = LogFetcher::new(
-            table_info,
+            table_info.clone(),
             Arc::new(RpcClient::new()),
-            metadata,
+            metadata.clone(),
             status,
             &config,
             None,
             test_scanner_metrics(&table_path),
+            test_schema_getter(&table_info, &metadata),
         )?;
 
         let requests = fetcher.prepare_fetch_log_requests().await;
@@ -2648,12 +2749,18 @@ mod tests {
             let table_info = build_table_info(table_path.clone(), 1, 1);
             let cluster = build_cluster_arc(&table_path, 1, 1);
             let metadata = Arc::new(Metadata::new_for_test(cluster));
+            let rpc_client = Arc::new(RpcClient::new());
+            let admin = Arc::new(crate::client::admin::FlussAdmin::new(
+                rpc_client.clone(),
+                metadata.clone(),
+            ));
             let inner = LogScannerInner::new(
                 &table_info,
                 metadata,
-                Arc::new(RpcClient::new()),
+                rpc_client,
                 &Config::default(),
                 None,
+                admin,
             )
             .expect("build LogScannerInner");
             body(&inner);
@@ -2813,13 +2920,14 @@ mod tests {
                 let status = Arc::new(LogScannerStatus::new());
                 status.assign_scan_bucket(TableBucket::new(1, 0), 5);
                 let fetcher = LogFetcher::new(
-                    table_info,
+                    table_info.clone(),
                     Arc::new(RpcClient::new()),
                     metadata.clone(),
                     status,
                     &Config::default(),
                     None,
                     test_scanner_metrics(&table_path),
+                    test_schema_getter(&table_info, &metadata),
                 )
                 .expect("build LogFetcher");
 
@@ -2844,8 +2952,8 @@ mod tests {
                     metadata: metadata.clone(),
                     log_fetch_buffer: fetcher.log_fetch_buffer.clone(),
                     log_scanner_status: fetcher.log_scanner_status.clone(),
-                    read_context: fetcher.read_context.clone(),
-                    remote_read_context: fetcher.remote_read_context.clone(),
+                    resolver: Arc::clone(&fetcher.resolver),
+                    schema_getter: Arc::clone(&fetcher.schema_getter),
                     remote_log_downloader: fetcher.remote_log_downloader.clone(),
                     metrics: Arc::clone(&fetcher.metrics),
                     request_start_time: Instant::now(),
@@ -3156,12 +3264,18 @@ mod tests {
             let table_info = build_table_info(table_path.clone(), 1, 1);
             let cluster = build_cluster_arc(&table_path, 1, 1);
             let metadata = Arc::new(Metadata::new_for_test(cluster));
+            let rpc_client = Arc::new(RpcClient::new());
+            let admin = Arc::new(crate::client::admin::FlussAdmin::new(
+                rpc_client.clone(),
+                metadata.clone(),
+            ));
             let inner = LogScannerInner::new(
                 &table_info,
                 metadata,
-                Arc::new(RpcClient::new()),
+                rpc_client,
                 &Config::default(),
                 None,
+                admin,
             )
             .expect("build LogScannerInner");
 
