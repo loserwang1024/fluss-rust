@@ -554,16 +554,16 @@ impl DefaultCompletedFetch {
     }
 
     /// Resolve the ReadContext for a given batch based on its schema_id.
-    fn resolve_context_for_batch(&self, batch: &LogRecordBatch) -> Result<ReadContext> {
+    fn resolve_context_for_batch(&self, batch: &LogRecordBatch) -> Result<Arc<ReadContext>> {
         let schema_id = batch.schema_id();
         self.resolver
-            .resolve(schema_id, self.is_remote)
-            .ok_or_else(|| Error::UnexpectedError {
+            .resolve_or_register(schema_id, self.is_remote)
+            .map_err(|e| Error::UnexpectedError {
                 message: format!(
-                    "No ReadContext found for schema_id {schema_id} in bucket {}",
-                    self.table_bucket
+                    "No ReadContext found for schema_id {schema_id} in bucket {}: {e}",
+                    self.table_bucket,
                 ),
-                source: None,
+                source: Some(Box::new(e)),
             })
     }
 }
@@ -886,15 +886,19 @@ mod tests {
         MemoryLogRecordsArrowBuilder, RECORDS_OFFSET, ReadContext, to_arrow_schema,
     };
     use crate::row::GenericRow;
-    use crate::test_utils::build_table_info;
+    use crate::test_utils::{build_table_info, build_table_info_with_columns};
     use std::sync::Arc;
 
     fn test_resolver() -> Result<Arc<ReadContextResolver>> {
         let row_type = RowType::new(vec![DataField::new("id", DataTypes::int(), None)]);
         let arrow_schema = to_arrow_schema(&row_type)?;
         let row_type_arc = Arc::new(row_type);
-        let local_ctx = ReadContext::new(arrow_schema.clone(), row_type_arc.clone(), false);
-        let remote_ctx = ReadContext::new(arrow_schema, row_type_arc, true);
+        let local_ctx = Arc::new(ReadContext::new(
+            arrow_schema.clone(),
+            row_type_arc.clone(),
+            false,
+        ));
+        let remote_ctx = Arc::new(ReadContext::new(arrow_schema, row_type_arc, true));
         Ok(Arc::new(ReadContextResolver::new(
             1, local_ctx, remote_ctx, None,
         )))
@@ -978,8 +982,12 @@ mod tests {
         let log_records = LogRecordsBatches::new(data.clone());
         let arrow_schema = to_arrow_schema(&row_type)?;
         let row_type_arc = Arc::new(row_type);
-        let local_ctx = ReadContext::new(arrow_schema.clone(), row_type_arc.clone(), false);
-        let remote_ctx = ReadContext::new(arrow_schema, row_type_arc, true);
+        let local_ctx = Arc::new(ReadContext::new(
+            arrow_schema.clone(),
+            row_type_arc.clone(),
+            false,
+        ));
+        let remote_ctx = Arc::new(ReadContext::new(arrow_schema, row_type_arc, true));
         let resolver = Arc::new(ReadContextResolver::new(1, local_ctx, remote_ctx, None));
         let mut fetch = DefaultCompletedFetch::new(
             TableBucket::new(1, 0),
@@ -997,6 +1005,78 @@ mod tests {
 
         let empty = fetch.fetch_records(10)?;
         assert!(empty.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_schema_fetch_batches_pads_missing_columns() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let old_fields = vec![DataField::new("id", DataTypes::int(), None)];
+        let new_fields = vec![
+            DataField::new("id", DataTypes::int(), None),
+            DataField::new("name", DataTypes::string(), None),
+        ];
+        let old_table_info = Arc::new(build_table_info_with_columns(
+            table_path.clone(),
+            1,
+            1,
+            old_fields,
+        ));
+        let old_row_type = old_table_info.get_row_type().clone();
+        let new_table_info = build_table_info_with_columns(table_path.clone(), 1, 1, new_fields);
+        let new_row_type = new_table_info.get_row_type().clone();
+        let physical_table_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+
+        let mut builder = MemoryLogRecordsArrowBuilder::new(
+            0,
+            &old_row_type,
+            false,
+            ArrowCompressionInfo {
+                compression_type: ArrowCompressionType::None,
+                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+            },
+            usize::MAX,
+            Arc::new(ArrowCompressionRatioEstimator::default()),
+        )?;
+
+        let mut row = GenericRow::new(1);
+        row.set_field(0, 1_i32);
+        let record = WriteRecord::for_append(old_table_info.clone(), physical_table_path, 1, &row);
+        builder.append(&record)?;
+
+        let data = builder.build()?;
+        let new_arrow_schema = to_arrow_schema(&new_row_type)?;
+        let new_row_type_arc = Arc::new(new_row_type);
+        let local_ctx = Arc::new(
+            ReadContext::new(new_arrow_schema.clone(), new_row_type_arc.clone(), false)
+                .with_fluss_row_type(new_row_type_arc.clone()),
+        );
+        let remote_ctx = Arc::new(
+            ReadContext::new(new_arrow_schema.clone(), new_row_type_arc.clone(), true)
+                .with_fluss_row_type(new_row_type_arc),
+        );
+        let resolver = Arc::new(
+            ReadContextResolver::new(1, local_ctx, remote_ctx, None).with_fixed_schema(true),
+        );
+        resolver.register_schema(0, old_table_info.get_schema())?;
+
+        let mut fetch = DefaultCompletedFetch::new(
+            TableBucket::new(1, 0),
+            LogRecordsBatches::new(data.clone()),
+            data.len(),
+            resolver,
+            false,
+            0,
+            0,
+        );
+
+        let batches = fetch.fetch_batches(10)?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0].0;
+        assert_eq!(batch.schema(), new_arrow_schema);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.column(1).null_count(), 1);
 
         Ok(())
     }
@@ -1049,12 +1129,16 @@ mod tests {
         let new_len = ((data.len() - LOG_OVERHEAD) as i32).to_le_bytes();
         data[LENGTH_OFFSET..LENGTH_OFFSET + LENGTH_LENGTH].copy_from_slice(&new_len);
 
-        let read_context = ReadContext::new(
+        let read_context = Arc::new(ReadContext::new(
             to_arrow_schema(&row_type)?,
             Arc::new(row_type.clone()),
             false,
-        );
-        let remote_ctx = ReadContext::new(to_arrow_schema(&row_type)?, Arc::new(row_type), true);
+        ));
+        let remote_ctx = Arc::new(ReadContext::new(
+            to_arrow_schema(&row_type)?,
+            Arc::new(row_type),
+            true,
+        ));
         let resolver = Arc::new(ReadContextResolver::new(1, read_context, remote_ctx, None));
         let mut fetch = DefaultCompletedFetch::new(
             TableBucket::new(1, 0),

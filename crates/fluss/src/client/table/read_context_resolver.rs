@@ -23,10 +23,15 @@
 //!
 //! When projection is active, the schema is pinned at scanner creation time
 //! and all batches use the initial ReadContext regardless of schema_id.
+//!
+//! When fixed-schema mode is active, batches are still decoded with their
+//! write-time schema and then aligned to the scanner creation schema.
 
-use crate::error::Result;
-use crate::metadata::Schema;
+use crate::client::ClientSchemaGetter;
+use crate::error::{Error, Result};
+use crate::metadata::{RowType, Schema};
 use crate::record::{ReadContext, to_arrow_schema};
+use arrow_schema::SchemaRef;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,20 +44,28 @@ pub(crate) struct ReadContextResolver {
     contexts: RwLock<HashMap<i16, ResolvedContexts>>,
     /// When Some, projection is active and schema is pinned to the initial one.
     projected_fields: Option<Vec<usize>>,
+    /// Used to lazily fetch schema versions when decoding a batch whose schema
+    /// was not prewarmed by the fetch response path.
+    schema_getter: Option<Arc<ClientSchemaGetter>>,
+    /// When true, contexts for older schemas still decode with their write-time
+    /// schema, then align the output to the scanner creation schema.
+    fixed_schema: bool,
+    fixed_target_schema: Option<SchemaRef>,
+    fixed_target_row_type: Option<Arc<RowType>>,
 }
 
 /// A pair of ReadContexts for local and remote reads.
 struct ResolvedContexts {
-    local: ReadContext,
-    remote: ReadContext,
+    local: Arc<ReadContext>,
+    remote: Arc<ReadContext>,
 }
 
 impl ReadContextResolver {
     /// Create a new resolver with the initial schema's ReadContexts.
     pub fn new(
         initial_schema_id: i16,
-        local_context: ReadContext,
-        remote_context: ReadContext,
+        local_context: Arc<ReadContext>,
+        remote_context: Arc<ReadContext>,
         projected_fields: Option<Vec<usize>>,
     ) -> Self {
         let mut map = HashMap::new();
@@ -67,13 +80,42 @@ impl ReadContextResolver {
             initial_schema_id,
             contexts: RwLock::new(map),
             projected_fields,
+            schema_getter: None,
+            fixed_schema: false,
+            fixed_target_schema: None,
+            fixed_target_row_type: None,
         }
+    }
+
+    pub fn with_schema_getter(mut self, schema_getter: Arc<ClientSchemaGetter>) -> Self {
+        self.schema_getter = Some(schema_getter);
+        self
+    }
+
+    pub fn with_fixed_schema(mut self, fixed_schema: bool) -> Self {
+        self.fixed_schema = fixed_schema;
+        if fixed_schema {
+            let fixed_target = {
+                let guard = self.contexts.read();
+                guard
+                    .get(&self.initial_schema_id)
+                    .map(|ctx| (ctx.local.target_schema(), ctx.local.row_type_arc()))
+            };
+            if let Some((target_schema, target_row_type)) = fixed_target {
+                self.fixed_target_schema = Some(target_schema);
+                self.fixed_target_row_type = Some(target_row_type);
+            }
+        } else {
+            self.fixed_target_schema = None;
+            self.fixed_target_row_type = None;
+        }
+        self
     }
 
     /// Resolve the ReadContext for the given schema_id.
     /// Returns the initial context if projection is active (schema pinned).
     /// Returns None if the schema_id is not yet cached.
-    pub fn resolve(&self, schema_id: i16, is_remote: bool) -> Option<ReadContext> {
+    pub fn resolve(&self, schema_id: i16, is_remote: bool) -> Option<Arc<ReadContext>> {
         // If projection is active, always return the initial context
         let effective_id = if self.projected_fields.is_some() {
             self.initial_schema_id
@@ -84,20 +126,52 @@ impl ReadContextResolver {
         let guard = self.contexts.read();
         guard.get(&effective_id).map(|ctx| {
             if is_remote {
-                ctx.remote.clone()
+                Arc::clone(&ctx.remote)
             } else {
-                ctx.local.clone()
+                Arc::clone(&ctx.local)
             }
         })
     }
 
-    /// Check if a schema_id is already cached.
-    pub fn contains(&self, schema_id: i16) -> bool {
-        if self.projected_fields.is_some() {
-            // projection pinned, always have the answer
-            true
+    /// Resolve the ReadContext for a batch, lazily fetching and registering the
+    /// schema if it was not prewarmed.
+    pub fn resolve_or_register(&self, schema_id: i16, is_remote: bool) -> Result<Arc<ReadContext>> {
+        if let Some(ctx) = self.resolve(schema_id, is_remote) {
+            return Ok(ctx);
+        }
+
+        let schema_getter = self
+            .schema_getter
+            .as_ref()
+            .ok_or_else(|| Error::UnexpectedError {
+                message: format!("No schema getter configured for schema_id {schema_id}"),
+                source: None,
+            })?
+            .clone();
+        let schema = Self::fetch_schema_blocking(schema_getter, schema_id)?;
+        self.register_schema(schema_id, &schema)?;
+
+        self.resolve(schema_id, is_remote)
+            .ok_or_else(|| Error::UnexpectedError {
+                message: format!("No ReadContext found for schema_id {schema_id} after register"),
+                source: None,
+            })
+    }
+
+    fn fetch_schema_blocking(
+        schema_getter: Arc<ClientSchemaGetter>,
+        schema_id: i16,
+    ) -> Result<Arc<Schema>> {
+        let fetch = async move { schema_getter.get_schema(schema_id as i32).await };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::thread::spawn(move || handle.block_on(fetch))
+                .join()
+                .map_err(|_| Error::UnexpectedError {
+                    message: format!("Schema fetch thread panicked for schema_id {schema_id}"),
+                    source: None,
+                })?
         } else {
-            self.contexts.read().contains_key(&schema_id)
+            futures::executor::block_on(fetch)
         }
     }
 
@@ -112,14 +186,30 @@ impl ReadContextResolver {
             return Ok(());
         }
 
-        let row_type = schema.row_type();
-        let arrow_schema = to_arrow_schema(row_type)?;
-        let row_type_arc = Arc::new(row_type.clone());
+        let source_row_type = schema.row_type();
+        let source_arrow_schema = to_arrow_schema(source_row_type)?;
+        let source_row_type_arc = Arc::new(source_row_type.clone());
+        let output_row_type = self
+            .fixed_target_row_type
+            .clone()
+            .unwrap_or_else(|| source_row_type_arc.clone());
 
-        let local_context = ReadContext::new(arrow_schema.clone(), row_type_arc.clone(), false)
-            .with_fluss_row_type(row_type_arc.clone());
-        let remote_context = ReadContext::new(arrow_schema, row_type_arc.clone(), true)
-            .with_fluss_row_type(row_type_arc);
+        let mut local_context =
+            ReadContext::new(source_arrow_schema.clone(), output_row_type.clone(), false)
+                .with_fluss_row_type(output_row_type.clone());
+        let mut remote_context =
+            ReadContext::new(source_arrow_schema, output_row_type.clone(), true)
+                .with_fluss_row_type(output_row_type);
+
+        if self.fixed_schema {
+            if let Some(target_schema) = &self.fixed_target_schema {
+                local_context = local_context.with_target_schema_alignment(target_schema.clone());
+                remote_context = remote_context.with_target_schema_alignment(target_schema.clone());
+            }
+        }
+
+        let local_context = Arc::new(local_context);
+        let remote_context = Arc::new(remote_context);
 
         self.contexts.write().insert(
             schema_id,
@@ -141,46 +231,4 @@ impl ReadContextResolver {
     pub fn projected_fields(&self) -> Option<&[usize]> {
         self.projected_fields.as_deref()
     }
-}
-
-/// Extract all unique schema_ids from raw log record batch bytes.
-///
-/// Scans through the concatenated batch buffer reading each batch header
-/// to extract the schema_id field. Used to pre-resolve schemas asynchronously
-/// before synchronous record decoding.
-pub(crate) fn extract_schema_ids(data: &[u8]) -> Vec<i16> {
-    use crate::record::{LENGTH_OFFSET, LOG_OVERHEAD, SCHEMA_ID_OFFSET};
-    use byteorder::{ByteOrder, LittleEndian};
-
-    let mut schema_ids = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut pos = 0;
-
-    while pos + LOG_OVERHEAD <= data.len() {
-        // Read batch length at LENGTH_OFFSET within the current batch
-        let length_pos = pos + LENGTH_OFFSET;
-        if length_pos + 4 > data.len() {
-            break;
-        }
-        let batch_size_bytes = LittleEndian::read_i32(&data[length_pos..length_pos + 4]);
-        if batch_size_bytes < 0 {
-            break;
-        }
-        let batch_total_size = batch_size_bytes as usize + LOG_OVERHEAD;
-
-        // Read schema_id
-        let schema_id_pos = pos + SCHEMA_ID_OFFSET;
-        if schema_id_pos + 2 > data.len() {
-            break;
-        }
-        let schema_id = LittleEndian::read_i16(&data[schema_id_pos..schema_id_pos + 2]);
-        if seen.insert(schema_id) {
-            schema_ids.push(schema_id);
-        }
-
-        // Advance to next batch
-        pos += batch_total_size;
-    }
-
-    schema_ids
 }
