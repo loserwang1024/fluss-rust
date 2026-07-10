@@ -1787,7 +1787,7 @@ impl LogFetcher {
                                     return Ok(result);
                                 }
 
-                                self.resolver.resolve_or_register(schema_id, false).await?;
+                                self.resolver.fetch_and_register(schema_id).await?;
                                 continue;
                             }
                         }
@@ -1997,7 +1997,7 @@ impl LogFetcher {
                                     return Ok(result);
                                 }
 
-                                self.resolver.resolve_or_register(schema_id, false).await?;
+                                self.resolver.fetch_and_register(schema_id).await?;
                                 continue;
                             }
                         }

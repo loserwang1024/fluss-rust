@@ -82,14 +82,22 @@ pub trait CompletedFetch: Send + Sync {
 /// fetch. Missing schemas are surfaced to the async scanner layer instead of
 /// blocking the current Tokio worker from inside this synchronous trait.
 pub(crate) enum FetchResult<T> {
+    /// Decoded data which is ready to return. The value may be empty when the
+    /// completed fetch has reached its end.
     Data(T),
+    /// Decoding is paused on the current raw batch. The async scanner must
+    /// fetch/register this schema and then retry the same completed fetch.
     SchemaRequired(i16),
 }
-
 enum FetchStep<T> {
-    Item(T),
-    End,
+    /// The current raw batch cannot be decoded until this schema ID is loaded.
     SchemaRequired(i16),
+
+    /// One record or Arrow batch was produced, and this completed fetch may
+    /// still contain more data to read.
+    InProgress(T),
+    /// The completed fetch has no more raw batches or records.
+    End,
 }
 
 /// Represents a pending fetch that is waiting to be completed
@@ -483,7 +491,7 @@ impl DefaultCompletedFetch {
                 .and_then(Iterator::next)
             {
                 if record.offset() >= self.next_fetch_offset {
-                    return Ok(FetchStep::Item(record));
+                    return Ok(FetchStep::InProgress(record));
                 }
             } else {
                 if self.pending_record_batch.is_none() {
@@ -523,7 +531,7 @@ impl DefaultCompletedFetch {
         if self.cached_record_error.is_none() {
             self.corrupt_last_record = true;
             match self.next_fetched_record() {
-                Ok(FetchStep::Item(record)) => {
+                Ok(FetchStep::InProgress(record)) => {
                     self.corrupt_last_record = false;
                     self.last_record = Some(record);
                 }
@@ -546,7 +554,7 @@ impl DefaultCompletedFetch {
         };
 
         out.push(record);
-        FetchStep::Item(())
+        FetchStep::InProgress(())
     }
 
     fn finish_records(&mut self, records: Vec<ScanRecord>) -> FetchResult<Vec<ScanRecord>> {
@@ -622,7 +630,7 @@ impl DefaultCompletedFetch {
 
             self.next_fetch_offset = log_batch.next_log_offset();
             self.records_read += record_batch.num_rows();
-            return Ok(FetchStep::Item((record_batch, effective_base_offset)));
+            return Ok(FetchStep::InProgress((record_batch, effective_base_offset)));
         }
     }
 
@@ -676,7 +684,7 @@ impl CompletedFetch for DefaultCompletedFetch {
 
         while scan_records.len() < max_records {
             match self.fetch_one_record(&mut scan_records) {
-                FetchStep::Item(()) => {}
+                FetchStep::InProgress(()) => {}
                 FetchStep::End => break,
                 FetchStep::SchemaRequired(schema_id) => {
                     if scan_records.is_empty()
@@ -701,7 +709,7 @@ impl CompletedFetch for DefaultCompletedFetch {
             .is_some_and(|record| *record.change_type() == ChangeType::UpdateBefore)
         {
             match self.fetch_one_record(&mut scan_records) {
-                FetchStep::Item(()) | FetchStep::End => {}
+                FetchStep::InProgress(()) | FetchStep::End => {}
                 FetchStep::SchemaRequired(schema_id) => {
                     self.pending_records = scan_records;
                     return Ok(FetchResult::SchemaRequired(schema_id));
@@ -741,7 +749,7 @@ impl CompletedFetch for DefaultCompletedFetch {
 
         for _ in 0..max_batches {
             match self.next_fetched_batch()? {
-                FetchStep::Item(batch_with_offset) => batches.push(batch_with_offset),
+                FetchStep::InProgress(batch_with_offset) => batches.push(batch_with_offset),
                 FetchStep::End => break,
                 FetchStep::SchemaRequired(schema_id) => {
                     if batches.is_empty() {

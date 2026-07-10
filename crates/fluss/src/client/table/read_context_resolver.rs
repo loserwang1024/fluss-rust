@@ -133,37 +133,13 @@ impl ReadContextResolver {
         })
     }
 
-    /// Resolve the ReadContext for a batch, lazily fetching and registering the
-    /// schema if it was not prewarmed.
-    ///
-    /// This is deliberately async. Blocking here while running on a Tokio
-    /// worker can deadlock a current-thread runtime because the schema RPC
-    /// itself needs that same runtime to make progress.
-    pub async fn resolve_or_register(
-        &self,
-        schema_id: i16,
-        is_remote: bool,
-    ) -> Result<Arc<ReadContext>> {
-        if let Some(ctx) = self.resolve(schema_id, is_remote) {
-            return Ok(ctx);
-        }
-
-        self.fetch_and_register(schema_id).await?;
-
-        self.resolve(schema_id, is_remote)
-            .ok_or_else(|| Error::UnexpectedError {
-                message: format!("No ReadContext found for schema_id {schema_id} after register"),
-                source: None,
-            })
-    }
-
     /// Fetch and register one schema version without blocking a Tokio worker.
     ///
     /// Callers should invoke this only after encountering a concrete batch
     /// whose schema is absent. This keeps remote log files streaming: no scan
     /// of the remaining segment is needed to discover all schema IDs up front.
-    async fn fetch_and_register(&self, schema_id: i16) -> Result<()> {
-        if self.resolve(schema_id, false).is_some() {
+    pub async fn fetch_and_register(&self, schema_id: i16) -> Result<()> {
+        if self.projected_fields.is_some() || self.contexts.read().contains_key(&schema_id) {
             return Ok(());
         }
 
