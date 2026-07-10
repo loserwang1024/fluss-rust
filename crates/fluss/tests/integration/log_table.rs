@@ -1953,16 +1953,27 @@ mod table_test {
         admin.drop_table(&table_path, false).await.expect("drop");
     }
 
-    /// Test that a single log scanner can read records across a schema change
-    /// (add column). Records written before the change should have NULL for the
-    /// new column, and records written after should carry the new column's value.
     #[tokio::test]
-    async fn schema_evolution_add_column_log_scanner() {
+    async fn schema_evolution_add_column_log_scanner_dynamic_schema() {
+        run_schema_evolution_add_column_log_scanner(false).await;
+    }
+
+    #[tokio::test]
+    async fn schema_evolution_add_column_log_scanner_fixed_schema() {
+        run_schema_evolution_add_column_log_scanner(true).await;
+    }
+
+    /// Test that a single log scanner can read records across a schema change
+    /// (add column) in both dynamic-schema and fixed-schema modes.
+    async fn run_schema_evolution_add_column_log_scanner(fixed_schema: bool) {
         let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
         let admin = connection.get_admin().expect("Failed to get admin");
 
-        let table_path = TablePath::new("fluss", "test_schema_evolution_log_scanner");
+        let table_path = TablePath::new(
+            "fluss",
+            format!("test_schema_evolution_log_scanner_fixed_{fixed_schema}"),
+        );
 
         // 1. Create table with initial schema: (id INT, name STRING)
         let table_descriptor = TableDescriptor::builder()
@@ -1986,6 +1997,7 @@ mod table_test {
             .expect("Failed to get table");
         let log_scanner = table
             .new_scan()
+            .with_fixed_schema(fixed_schema)
             .create_log_scanner()
             .expect("Failed to create log scanner");
         let num_buckets = table.get_table_info().get_num_buckets();
@@ -2112,9 +2124,9 @@ mod table_test {
         assert_eq!(
             new_records,
             vec![
-                (4, "dave".to_string(), Some(30)),
-                (5, "eve".to_string(), Some(25)),
-                (6, "frank".to_string(), Some(40)),
+                (4, "dave".to_string(), (!fixed_schema).then_some(30),),
+                (5, "eve".to_string(), (!fixed_schema).then_some(25)),
+                (6, "frank".to_string(), (!fixed_schema).then_some(40),),
             ]
         );
 

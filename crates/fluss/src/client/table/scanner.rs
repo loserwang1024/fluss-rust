@@ -22,7 +22,7 @@ use crate::client::metadata::Metadata;
 use crate::client::table::batch_scanner::LimitBatchScanner;
 use crate::client::table::log_fetch_buffer::{
     CompletedFetch, DefaultCompletedFetch, FetchErrorAction, FetchErrorContext, FetchErrorLogLevel,
-    LogFetchBuffer, RemotePendingFetch,
+    FetchResult, LogFetchBuffer, RemotePendingFetch,
 };
 use crate::client::table::read_context_resolver::ReadContextResolver;
 use crate::client::table::remote_log::{RemoteLogDownloader, RemoteLogFetchInfo};
@@ -903,7 +903,7 @@ impl LogScannerInner {
     }
 
     async fn poll_for_fetches(&self) -> Result<HashMap<TableBucket, Vec<ScanRecord>>> {
-        let result = self.log_fetcher.collect_fetches()?;
+        let result = self.log_fetcher.collect_fetches().await?;
         if !result.is_empty() {
             return Ok(result);
         }
@@ -912,7 +912,7 @@ impl LogScannerInner {
         self.log_fetcher.send_fetches().await?;
 
         // Collect completed fetches from buffer
-        self.log_fetcher.collect_fetches()
+        self.log_fetcher.collect_fetches().await
     }
 
     async fn poll_batches(&self, timeout: Duration) -> Result<Vec<ScanBatch>> {
@@ -947,13 +947,13 @@ impl LogScannerInner {
     }
 
     async fn poll_for_batches(&self) -> Result<Vec<ScanBatch>> {
-        let result = self.log_fetcher.collect_batches()?;
+        let result = self.log_fetcher.collect_batches().await?;
         if !result.is_empty() {
             return Ok(result);
         }
 
         self.log_fetcher.send_fetches().await?;
-        self.log_fetcher.collect_batches()
+        self.log_fetcher.collect_batches().await
     }
 }
 
@@ -1705,7 +1705,7 @@ impl LogFetcher {
 
     /// Collect completed fetches from buffer
     /// Reference: LogFetchCollector.collectFetch in Java
-    fn collect_fetches(&self) -> Result<HashMap<TableBucket, Vec<ScanRecord>>> {
+    async fn collect_fetches(&self) -> Result<HashMap<TableBucket, Vec<ScanRecord>>> {
         let mut result: HashMap<TableBucket, Vec<ScanRecord>> = HashMap::new();
         let mut records_remaining = self.max_poll_records;
 
@@ -1749,10 +1749,10 @@ impl LogFetcher {
                 } else {
                     // Fetch records from next_in_line
                     if let Some(mut next_fetch) = next_in_line {
-                        let records = match self
+                        let fetch_result = match self
                             .fetch_records_from_fetch(&mut next_fetch, records_remaining)
                         {
-                            Ok(records) => records,
+                            Ok(fetch_result) => fetch_result,
                             Err(e) => {
                                 if !next_fetch.is_consumed() {
                                     self.log_fetch_buffer
@@ -1762,14 +1762,34 @@ impl LogFetcher {
                             }
                         };
 
-                        if !records.is_empty() {
-                            let table_bucket = next_fetch.table_bucket().clone();
-                            // Merge with existing records for this bucket
-                            let existing = result.entry(table_bucket).or_default();
-                            let records_count = records.len();
-                            existing.extend(records);
+                        match fetch_result {
+                            FetchResult::Data(records) => {
+                                if !records.is_empty() {
+                                    let table_bucket = next_fetch.table_bucket().clone();
+                                    // Merge with existing records for this bucket
+                                    let existing = result.entry(table_bucket).or_default();
+                                    let records_count = records.len();
+                                    existing.extend(records);
 
-                            records_remaining = records_remaining.saturating_sub(records_count);
+                                    records_remaining =
+                                        records_remaining.saturating_sub(records_count);
+                                }
+                            }
+                            FetchResult::SchemaRequired(schema_id) => {
+                                // Put the fetch back before awaiting. If this poll future is
+                                // cancelled, the exact raw batch remains available for retry.
+                                self.log_fetch_buffer
+                                    .set_next_in_line_fetch(Some(next_fetch));
+
+                                // Never await after collecting user-visible records: dropping
+                                // the future at that point would otherwise lose the local result.
+                                if !result.is_empty() {
+                                    return Ok(result);
+                                }
+
+                                self.resolver.resolve_or_register(schema_id, false).await?;
+                                continue;
+                            }
                         }
 
                         // If the fetch is not fully consumed, put it back for the next round
@@ -1888,7 +1908,7 @@ impl LogFetcher {
         &self,
         next_in_line_fetch: &mut Box<dyn CompletedFetch>,
         max_records: usize,
-    ) -> Result<Vec<ScanRecord>> {
+    ) -> Result<FetchResult<Vec<ScanRecord>>> {
         let table_bucket = next_in_line_fetch.table_bucket().clone();
         let current_offset = self.log_scanner_status.get_bucket_offset(&table_bucket);
 
@@ -1897,7 +1917,7 @@ impl LogFetcher {
                 "Ignoring fetched records for {table_bucket:?} since the bucket has been unsubscribed"
             );
             next_in_line_fetch.drain();
-            return Ok(Vec::new());
+            return Ok(FetchResult::Data(Vec::new()));
         }
 
         let current_offset = current_offset.unwrap();
@@ -1905,32 +1925,34 @@ impl LogFetcher {
 
         // Check if this fetch is next in line
         if fetch_offset == current_offset {
-            let records = next_in_line_fetch.fetch_records(max_records)?;
-            let next_fetch_offset = next_in_line_fetch.next_fetch_offset();
+            let fetch_result = next_in_line_fetch.fetch_records(max_records)?;
+            if matches!(fetch_result, FetchResult::Data(_)) {
+                let next_fetch_offset = next_in_line_fetch.next_fetch_offset();
 
-            if next_fetch_offset > current_offset {
-                self.log_scanner_status
-                    .update_offset(&table_bucket, next_fetch_offset);
+                if next_fetch_offset > current_offset {
+                    self.log_scanner_status
+                        .update_offset(&table_bucket, next_fetch_offset);
+                }
+
+                if next_in_line_fetch.is_consumed() && next_in_line_fetch.records_read() > 0 {
+                    self.log_scanner_status
+                        .move_bucket_to_end(table_bucket.clone());
+                }
             }
 
-            if next_in_line_fetch.is_consumed() && next_in_line_fetch.records_read() > 0 {
-                self.log_scanner_status
-                    .move_bucket_to_end(table_bucket.clone());
-            }
-
-            Ok(records)
+            Ok(fetch_result)
         } else {
             // These records aren't next in line, ignore them
             warn!(
                 "Ignoring fetched records for {table_bucket:?} at offset {fetch_offset} since the current offset is {current_offset}"
             );
             next_in_line_fetch.drain();
-            Ok(Vec::new())
+            Ok(FetchResult::Data(Vec::new()))
         }
     }
 
     /// Collect completed fetches as ScanBatches (with bucket and offset metadata)
-    fn collect_batches(&self) -> Result<Vec<ScanBatch>> {
+    async fn collect_batches(&self) -> Result<Vec<ScanBatch>> {
         // Limit memory usage with both batch count and byte size constraints.
         // Max 100 batches per poll, but also check total bytes (soft cap ~64MB).
         const MAX_BATCHES: usize = 100;
@@ -1945,20 +1967,39 @@ impl LogFetcher {
 
                 match next_in_line {
                     Some(mut next_fetch) if !next_fetch.is_consumed() => {
-                        let scan_batches =
+                        let fetch_result =
                             self.fetch_batches_from_fetch(&mut next_fetch, batches_remaining)?;
-                        let batch_count = scan_batches.len();
+                        match fetch_result {
+                            FetchResult::Data(scan_batches) => {
+                                let batch_count = scan_batches.len();
 
-                        if !scan_batches.is_empty() {
-                            // Track bytes consumed (soft cap - may exceed by one fetch)
-                            let batch_bytes: usize = scan_batches
-                                .iter()
-                                .map(|sb| sb.batch().get_array_memory_size())
-                                .sum();
-                            bytes_consumed += batch_bytes;
+                                if !scan_batches.is_empty() {
+                                    // Track bytes consumed (soft cap - may exceed by one fetch)
+                                    let batch_bytes: usize = scan_batches
+                                        .iter()
+                                        .map(|sb| sb.batch().get_array_memory_size())
+                                        .sum();
+                                    bytes_consumed += batch_bytes;
 
-                            result.extend(scan_batches);
-                            batches_remaining = batches_remaining.saturating_sub(batch_count);
+                                    result.extend(scan_batches);
+                                    batches_remaining =
+                                        batches_remaining.saturating_sub(batch_count);
+                                }
+                            }
+                            FetchResult::SchemaRequired(schema_id) => {
+                                // Preserve the current file-backed batch across await/cancel.
+                                self.log_fetch_buffer
+                                    .set_next_in_line_fetch(Some(next_fetch));
+
+                                // Return already decoded batches before doing another async RPC,
+                                // keeping cancellation from discarding user-visible progress.
+                                if !result.is_empty() {
+                                    return Ok(result);
+                                }
+
+                                self.resolver.resolve_or_register(schema_id, false).await?;
+                                continue;
+                            }
                         }
 
                         if !next_fetch.is_consumed() {
@@ -2011,7 +2052,7 @@ impl LogFetcher {
         &self,
         next_in_line_fetch: &mut Box<dyn CompletedFetch>,
         max_batches: usize,
-    ) -> Result<Vec<ScanBatch>> {
+    ) -> Result<FetchResult<Vec<ScanBatch>>> {
         let table_bucket = next_in_line_fetch.table_bucket().clone();
         let current_offset = self.log_scanner_status.get_bucket_offset(&table_bucket);
 
@@ -2020,34 +2061,42 @@ impl LogFetcher {
                 "Ignoring fetched batches for {table_bucket:?} since the bucket has been unsubscribed"
             );
             next_in_line_fetch.drain();
-            return Ok(Vec::new());
+            return Ok(FetchResult::Data(Vec::new()));
         }
 
         let current_offset = current_offset.unwrap();
         let fetch_offset = next_in_line_fetch.next_fetch_offset();
 
         if fetch_offset == current_offset {
-            let batches_with_offsets = next_in_line_fetch.fetch_batches(max_batches)?;
-            let next_fetch_offset = next_in_line_fetch.next_fetch_offset();
+            match next_in_line_fetch.fetch_batches(max_batches)? {
+                FetchResult::Data(batches_with_offsets) => {
+                    let next_fetch_offset = next_in_line_fetch.next_fetch_offset();
 
-            if next_fetch_offset > current_offset {
-                self.log_scanner_status
-                    .update_offset(&table_bucket, next_fetch_offset);
+                    if next_fetch_offset > current_offset {
+                        self.log_scanner_status
+                            .update_offset(&table_bucket, next_fetch_offset);
+                    }
+
+                    // Convert to ScanBatch with bucket info
+                    Ok(FetchResult::Data(
+                        batches_with_offsets
+                            .into_iter()
+                            .map(|(batch, base_offset)| {
+                                ScanBatch::new(table_bucket.clone(), batch, base_offset)
+                            })
+                            .collect(),
+                    ))
+                }
+                FetchResult::SchemaRequired(schema_id) => {
+                    Ok(FetchResult::SchemaRequired(schema_id))
+                }
             }
-
-            // Convert to ScanBatch with bucket info
-            Ok(batches_with_offsets
-                .into_iter()
-                .map(|(batch, base_offset)| {
-                    ScanBatch::new(table_bucket.clone(), batch, base_offset)
-                })
-                .collect())
         } else {
             warn!(
                 "Ignoring fetched batches for {table_bucket:?} at offset {fetch_offset} since the current offset is {current_offset}"
             );
             next_in_line_fetch.drain();
-            Ok(Vec::new())
+            Ok(FetchResult::Data(Vec::new()))
         }
     }
 
@@ -2446,7 +2495,7 @@ mod tests {
         );
         fetcher.log_fetch_buffer.add(Box::new(completed));
 
-        let fetched = fetcher.collect_fetches()?;
+        let fetched = fetcher.collect_fetches().await?;
         assert_eq!(fetched.get(&bucket).unwrap().len(), 1);
         assert_eq!(status.get_bucket_offset(&bucket), Some(1));
         Ok(())
@@ -2486,7 +2535,7 @@ mod tests {
         ));
 
         let records = fetcher.fetch_records_from_fetch(&mut completed, 10)?;
-        assert!(records.is_empty());
+        assert!(matches!(records, FetchResult::Data(records) if records.is_empty()));
         assert!(completed.is_consumed());
         Ok(())
     }

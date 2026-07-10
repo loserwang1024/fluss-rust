@@ -65,8 +65,9 @@ pub trait CompletedFetch: Send + Sync {
     fn api_error(&self) -> Option<&ApiError>;
     fn fetch_error_context(&self) -> Option<&FetchErrorContext>;
     fn take_error(&mut self) -> Option<Error>;
-    fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>>;
-    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>>;
+    fn fetch_records(&mut self, max_records: usize) -> Result<FetchResult<Vec<ScanRecord>>>;
+    fn fetch_batches(&mut self, max_batches: usize)
+    -> Result<FetchResult<Vec<(RecordBatch, i64)>>>;
     fn is_consumed(&self) -> bool;
     fn records_read(&self) -> usize;
     fn drain(&mut self);
@@ -75,6 +76,20 @@ pub trait CompletedFetch: Send + Sync {
     fn is_initialized(&self) -> bool;
     fn set_initialized(&mut self);
     fn next_fetch_offset(&self) -> i64;
+}
+
+/// Result of synchronously decoding data already available in a completed
+/// fetch. Missing schemas are surfaced to the async scanner layer instead of
+/// blocking the current Tokio worker from inside this synchronous trait.
+pub(crate) enum FetchResult<T> {
+    Data(T),
+    SchemaRequired(i16),
+}
+
+enum FetchStep<T> {
+    Item(T),
+    End,
+    SchemaRequired(i16),
 }
 
 /// Represents a pending fetch that is waiting to be completed
@@ -350,6 +365,15 @@ pub struct DefaultCompletedFetch {
     records_read: usize,
     current_record_iterator: Option<LogRecordIterator>,
     current_record_batch: Option<LogRecordBatch>,
+    /// A raw batch which has been read from memory/the remote file but cannot
+    /// yet be decoded because its schema is not cached. Keeping it here makes
+    /// schema fetching cancellation-safe and avoids advancing through the
+    /// rest of a remote segment.
+    pending_record_batch: Option<LogRecordBatch>,
+    /// Records decoded before discovering that the matching `+U` needs a
+    /// schema which is not cached yet. They remain uncommitted until the pair
+    /// can be returned together.
+    pending_records: Vec<ScanRecord>,
     last_record: Option<ScanRecord>,
     cached_record_error: Option<String>,
     corrupt_last_record: bool,
@@ -381,6 +405,8 @@ impl DefaultCompletedFetch {
             records_read: 0,
             current_record_iterator: None,
             current_record_batch: None,
+            pending_record_batch: None,
+            pending_records: Vec::new(),
             last_record: None,
             cached_record_error: None,
             corrupt_last_record: false,
@@ -409,6 +435,8 @@ impl DefaultCompletedFetch {
             records_read: 0,
             current_record_iterator: None,
             current_record_batch: None,
+            pending_record_batch: None,
+            pending_records: Vec::new(),
             last_record: None,
             cached_record_error: None,
             corrupt_last_record: false,
@@ -438,6 +466,8 @@ impl DefaultCompletedFetch {
             records_read: 0,
             current_record_iterator: None,
             current_record_batch: None,
+            pending_record_batch: None,
+            pending_records: Vec::new(),
             last_record: None,
             cached_record_error: None,
             corrupt_last_record: false,
@@ -445,7 +475,7 @@ impl DefaultCompletedFetch {
     }
 
     /// Get the next fetched record, handling batch iteration and record skipping
-    fn next_fetched_record(&mut self) -> Result<Option<ScanRecord>> {
+    fn next_fetched_record(&mut self) -> Result<FetchStep<ScanRecord>> {
         loop {
             if let Some(record) = self
                 .current_record_iterator
@@ -453,19 +483,34 @@ impl DefaultCompletedFetch {
                 .and_then(Iterator::next)
             {
                 if record.offset() >= self.next_fetch_offset {
-                    return Ok(Some(record));
+                    return Ok(FetchStep::Item(record));
                 }
-            } else if let Some(batch_result) = self.log_record_batch.next() {
-                let batch = batch_result?;
-                let read_context = self.resolve_context_for_batch(&batch)?;
+            } else {
+                if self.pending_record_batch.is_none() {
+                    let Some(batch_result) = self.log_record_batch.next() else {
+                        if let Some(batch) = self.current_record_batch.take() {
+                            self.next_fetch_offset = batch.next_log_offset();
+                        }
+                        self.drain();
+                        return Ok(FetchStep::End);
+                    };
+                    self.pending_record_batch = Some(batch_result?);
+                }
+
+                let batch = self
+                    .pending_record_batch
+                    .as_ref()
+                    .expect("pending batch must be set before schema resolution");
+                let Some(read_context) = self.resolve_context_for_batch(batch) else {
+                    return Ok(FetchStep::SchemaRequired(batch.schema_id()));
+                };
+
+                let batch = self
+                    .pending_record_batch
+                    .take()
+                    .expect("pending batch must still be present after schema resolution");
                 self.current_record_iterator = Some(batch.records(&read_context)?);
                 self.current_record_batch = Some(batch);
-            } else {
-                if let Some(batch) = self.current_record_batch.take() {
-                    self.next_fetch_offset = batch.next_log_offset();
-                }
-                self.drain();
-                return Ok(None);
             }
         }
     }
@@ -474,17 +519,21 @@ impl DefaultCompletedFetch {
     /// pushed. A fetch error is cached and surfaced on a later call rather than
     /// propagated mid-batch (mirrors one iteration of Java
     /// `CompletedFetch.fetchRecord`).
-    fn fetch_one_record(&mut self, out: &mut Vec<ScanRecord>) -> bool {
+    fn fetch_one_record(&mut self, out: &mut Vec<ScanRecord>) -> FetchStep<()> {
         if self.cached_record_error.is_none() {
             self.corrupt_last_record = true;
             match self.next_fetched_record() {
-                Ok(Some(record)) => {
+                Ok(FetchStep::Item(record)) => {
                     self.corrupt_last_record = false;
                     self.last_record = Some(record);
                 }
-                Ok(None) => {
+                Ok(FetchStep::End) => {
                     self.corrupt_last_record = false;
                     self.last_record = None;
+                }
+                Ok(FetchStep::SchemaRequired(schema_id)) => {
+                    self.corrupt_last_record = false;
+                    return FetchStep::SchemaRequired(schema_id);
                 }
                 Err(e) => {
                     self.cached_record_error = Some(e.to_string());
@@ -493,13 +542,24 @@ impl DefaultCompletedFetch {
         }
 
         let Some(record) = self.last_record.take() else {
-            return false;
+            return FetchStep::End;
         };
 
-        self.next_fetch_offset = record.offset() + 1;
-        self.records_read += 1;
         out.push(record);
-        true
+        FetchStep::Item(())
+    }
+
+    fn finish_records(&mut self, records: Vec<ScanRecord>) -> FetchResult<Vec<ScanRecord>> {
+        if let Some(last) = records.last() {
+            // Reaching the end of the underlying fetch may advance past the
+            // last visible record (for example over an empty/control tail).
+            // Preserve that terminal offset instead of moving it backwards.
+            if !self.consumed {
+                self.next_fetch_offset = last.offset() + 1;
+            }
+            self.records_read += records.len();
+        }
+        FetchResult::Data(records)
     }
 
     fn fetch_error(&self) -> Error {
@@ -517,15 +577,28 @@ impl DefaultCompletedFetch {
     }
     /// Get the next batch with its base offset.
     /// Returns (RecordBatch, base_offset) where base_offset is the offset of the first record.
-    fn next_fetched_batch(&mut self) -> Result<Option<(RecordBatch, i64)>> {
+    fn next_fetched_batch(&mut self) -> Result<FetchStep<(RecordBatch, i64)>> {
         loop {
-            let Some(log_batch_result) = self.log_record_batch.next() else {
-                self.drain();
-                return Ok(None);
+            if self.pending_record_batch.is_none() {
+                let Some(log_batch_result) = self.log_record_batch.next() else {
+                    self.drain();
+                    return Ok(FetchStep::End);
+                };
+                self.pending_record_batch = Some(log_batch_result?);
+            }
+
+            let log_batch = self
+                .pending_record_batch
+                .as_ref()
+                .expect("pending batch must be set before schema resolution");
+            let Some(read_context) = self.resolve_context_for_batch(log_batch) else {
+                return Ok(FetchStep::SchemaRequired(log_batch.schema_id()));
             };
 
-            let log_batch = log_batch_result?;
-            let read_context = self.resolve_context_for_batch(&log_batch)?;
+            let log_batch = self
+                .pending_record_batch
+                .take()
+                .expect("pending batch must still be present after schema resolution");
             let mut record_batch = log_batch.record_batch(&read_context)?;
 
             // Skip empty batches
@@ -549,22 +622,14 @@ impl DefaultCompletedFetch {
 
             self.next_fetch_offset = log_batch.next_log_offset();
             self.records_read += record_batch.num_rows();
-            return Ok(Some((record_batch, effective_base_offset)));
+            return Ok(FetchStep::Item((record_batch, effective_base_offset)));
         }
     }
 
     /// Resolve the ReadContext for a given batch based on its schema_id.
-    fn resolve_context_for_batch(&self, batch: &LogRecordBatch) -> Result<Arc<ReadContext>> {
+    fn resolve_context_for_batch(&self, batch: &LogRecordBatch) -> Option<Arc<ReadContext>> {
         let schema_id = batch.schema_id();
-        self.resolver
-            .resolve_or_register(schema_id, self.is_remote)
-            .map_err(|e| Error::UnexpectedError {
-                message: format!(
-                    "No ReadContext found for schema_id {schema_id} in bucket {}: {e}",
-                    self.table_bucket,
-                ),
-                source: Some(Box::new(e)),
-            })
+        self.resolver.resolve(schema_id, self.is_remote)
     }
 }
 
@@ -585,7 +650,7 @@ impl CompletedFetch for DefaultCompletedFetch {
         self.error.take()
     }
 
-    fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>> {
+    fn fetch_records(&mut self, max_records: usize) -> Result<FetchResult<Vec<ScanRecord>>> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -604,14 +669,26 @@ impl CompletedFetch for DefaultCompletedFetch {
         }
 
         if self.consumed {
-            return Ok(Vec::new());
+            return Ok(FetchResult::Data(Vec::new()));
         }
 
-        let mut scan_records = Vec::new();
+        let mut scan_records = std::mem::take(&mut self.pending_records);
 
-        for _ in 0..max_records {
-            if !self.fetch_one_record(&mut scan_records) {
-                break;
+        while scan_records.len() < max_records {
+            match self.fetch_one_record(&mut scan_records) {
+                FetchStep::Item(()) => {}
+                FetchStep::End => break,
+                FetchStep::SchemaRequired(schema_id) => {
+                    if scan_records.is_empty()
+                        || scan_records
+                            .last()
+                            .is_some_and(|record| *record.change_type() == ChangeType::UpdateBefore)
+                    {
+                        self.pending_records = scan_records;
+                        return Ok(FetchResult::SchemaRequired(schema_id));
+                    }
+                    return Ok(self.finish_records(scan_records));
+                }
             }
         }
 
@@ -623,17 +700,26 @@ impl CompletedFetch for DefaultCompletedFetch {
             .last()
             .is_some_and(|record| *record.change_type() == ChangeType::UpdateBefore)
         {
-            self.fetch_one_record(&mut scan_records);
+            match self.fetch_one_record(&mut scan_records) {
+                FetchStep::Item(()) | FetchStep::End => {}
+                FetchStep::SchemaRequired(schema_id) => {
+                    self.pending_records = scan_records;
+                    return Ok(FetchResult::SchemaRequired(schema_id));
+                }
+            }
         }
 
         if self.cached_record_error.is_some() && scan_records.is_empty() {
             return Err(self.fetch_error());
         }
 
-        Ok(scan_records)
+        Ok(self.finish_records(scan_records))
     }
 
-    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
+    fn fetch_batches(
+        &mut self,
+        max_batches: usize,
+    ) -> Result<FetchResult<Vec<(RecordBatch, i64)>>> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -648,19 +734,25 @@ impl CompletedFetch for DefaultCompletedFetch {
         }
 
         if self.consumed {
-            return Ok(Vec::new());
+            return Ok(FetchResult::Data(Vec::new()));
         }
 
         let mut batches = Vec::with_capacity(max_batches.min(16));
 
         for _ in 0..max_batches {
             match self.next_fetched_batch()? {
-                Some(batch_with_offset) => batches.push(batch_with_offset),
-                None => break,
+                FetchStep::Item(batch_with_offset) => batches.push(batch_with_offset),
+                FetchStep::End => break,
+                FetchStep::SchemaRequired(schema_id) => {
+                    if batches.is_empty() {
+                        return Ok(FetchResult::SchemaRequired(schema_id));
+                    }
+                    return Ok(FetchResult::Data(batches));
+                }
             }
         }
 
-        Ok(batches)
+        Ok(FetchResult::Data(batches))
     }
 
     fn is_consumed(&self) -> bool {
@@ -679,6 +771,8 @@ impl CompletedFetch for DefaultCompletedFetch {
         self.cached_record_error = None;
         self.corrupt_last_record = false;
         self.last_record = None;
+        self.pending_record_batch = None;
+        self.pending_records.clear();
     }
 
     fn size_in_bytes(&self) -> usize {
@@ -736,11 +830,14 @@ impl CompletedFetch for RemoteCompletedFetch {
         self.inner.take_error()
     }
 
-    fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>> {
+    fn fetch_records(&mut self, max_records: usize) -> Result<FetchResult<Vec<ScanRecord>>> {
         self.inner.fetch_records(max_records)
     }
 
-    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
+    fn fetch_batches(
+        &mut self,
+        max_batches: usize,
+    ) -> Result<FetchResult<Vec<(RecordBatch, i64)>>> {
         self.inner.fetch_batches(max_batches)
     }
 
@@ -889,6 +986,15 @@ mod tests {
     use crate::test_utils::{build_table_info, build_table_info_with_columns};
     use std::sync::Arc;
 
+    fn expect_data<T>(result: FetchResult<T>) -> T {
+        match result {
+            FetchResult::Data(data) => data,
+            FetchResult::SchemaRequired(schema_id) => {
+                panic!("unexpected missing schema {schema_id}")
+            }
+        }
+    }
+
     fn test_resolver() -> Result<Arc<ReadContextResolver>> {
         let row_type = RowType::new(vec![DataField::new("id", DataTypes::int(), None)]);
         let arrow_schema = to_arrow_schema(&row_type)?;
@@ -999,11 +1105,11 @@ mod tests {
             0,
         );
 
-        let records = fetch.fetch_records(10)?;
+        let records = expect_data(fetch.fetch_records(10)?);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].offset(), 0);
 
-        let empty = fetch.fetch_records(10)?;
+        let empty = expect_data(fetch.fetch_records(10)?);
         assert!(empty.is_empty());
 
         Ok(())
@@ -1059,19 +1165,24 @@ mod tests {
         let resolver = Arc::new(
             ReadContextResolver::new(1, local_ctx, remote_ctx, None).with_fixed_schema(true),
         );
-        resolver.register_schema(0, old_table_info.get_schema())?;
 
         let mut fetch = DefaultCompletedFetch::new(
             TableBucket::new(1, 0),
             LogRecordsBatches::new(data.clone()),
             data.len(),
-            resolver,
+            Arc::clone(&resolver),
             false,
             0,
             0,
         );
 
-        let batches = fetch.fetch_batches(10)?;
+        assert!(matches!(
+            fetch.fetch_batches(10)?,
+            FetchResult::SchemaRequired(0)
+        ));
+        resolver.register_schema(0, old_table_info.get_schema())?;
+
+        let batches = expect_data(fetch.fetch_batches(10)?);
         assert_eq!(batches.len(), 1);
         let batch = &batches[0].0;
         assert_eq!(batch.schema(), new_arrow_schema);
@@ -1152,13 +1263,13 @@ mod tests {
 
         // max_records=2 cuts between -U (offset 1) and +U (offset 2); the pairing
         // guard pulls the +U so the batch ends on a complete pair.
-        let records = fetch.fetch_records(2)?;
+        let records = expect_data(fetch.fetch_records(2)?);
         assert_eq!(records.len(), 3, "pair guard should append the matching +U");
         assert_eq!(*records[0].change_type(), ChangeType::Insert);
         assert_eq!(*records[1].change_type(), ChangeType::UpdateBefore);
         assert_eq!(*records[2].change_type(), ChangeType::UpdateAfter);
 
-        let rest = fetch.fetch_records(10)?;
+        let rest = expect_data(fetch.fetch_records(10)?);
         assert!(rest.is_empty(), "all records consumed");
 
         Ok(())
