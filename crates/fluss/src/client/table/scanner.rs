@@ -78,7 +78,7 @@ impl<'a> TableScan<'a> {
             table_info,
             metadata,
             projected_fields: None,
-            fixed_schema: false,
+            fixed_schema: true,
             limit: None,
         }
     }
@@ -87,9 +87,11 @@ impl<'a> TableScan<'a> {
     ///
     /// When enabled, batches written with older schemas are decoded with their
     /// write-time schema and then aligned to the schema captured when the
-    /// scanner is created; missing columns are returned as nulls. When disabled
-    /// (the default), batches keep their write-time schema and may have
-    /// different column counts across schema changes.
+    /// scanner is created; missing columns are returned as nulls. This is the
+    /// default for both row and batch log scanners, ensuring that a scan exposes
+    /// one stable schema. When explicitly disabled, records and batches keep
+    /// their write-time schema and may have different column counts across
+    /// schema changes.
     pub fn with_fixed_schema(mut self, fixed_schema: bool) -> Self {
         self.fixed_schema = fixed_schema;
         self
